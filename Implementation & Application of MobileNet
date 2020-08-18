@@ -1,0 +1,574 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+import os
+import numpy as np
+from PIL import Image
+
+import torch
+import torchvision   
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import gc
+
+
+# In[ ]:
+
+
+#increase RAM in Google Colab, from 12 GB to 25 GB
+# a = []
+# while(1):
+#     a.append('1')
+
+
+# In[ ]:
+
+
+get_ipython().system('unzip validation_classification.zip')
+
+
+# In[ ]:
+
+
+get_ipython().system('tar -zxvf classify_medium.tar.gz')
+
+
+# In[ ]:
+
+
+class ConvBnReLU6(nn.Sequential):
+    def __init__(self, in_channel, out_channel, kernel_size, groups, stride = 1):
+        padding = (kernel_size - 1) // 2
+        super(ConvBnReLU6, self).__init__(
+            nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=kernel_size, \
+                      stride=stride , padding=padding, groups=groups, bias=False),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU6(inplace=True)
+        )
+
+class InvertedResidualBlock(nn.Module):
+
+    def __init__(self, in_channel, out_channel, stride=1, expansion=6 ):
+        super(InvertedResidualBlock, self).__init__()
+        self.conv1 = ConvBnReLU6(in_channel, in_channel*expansion, 1, 1)
+        self.conv2 = ConvBnReLU6(in_channel*expansion, in_channel*expansion, 3,                                  in_channel*expansion, stride) #depthwise conv
+        self.conv3 = nn.Conv2d(in_channel*expansion, out_channel, 1, 1,0, bias=False) #pointwise conv
+        self.bn = nn.BatchNorm2d(out_channel)
+        self.shortcut = nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=1, stride=stride, bias=False)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.bn(self.conv3(out))
+        out = out + self.shortcut(x)  #https://discuss.pytorch.org/t/encounter-the-runtimeerror-one-of-the-variables-needed-for-gradient-computation-has-been-modified-by-an-inplace-operation/836
+        return out
+
+
+# In[ ]:
+
+
+# !pip install torchsummaryX
+# from torchsummaryX import summary
+# test_resBlock = InvertedResidualBlock(3, 4)
+# summary(test_resBlock, torch.zeros((1, 3, 32, 32)))
+
+
+# In[ ]:
+
+
+train_dataset = torchvision.datasets.ImageFolder(root='/content/medium', 
+                                                 transform=torchvision.transforms.ToTensor())
+train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=256, 
+                                               shuffle=True, num_workers=16)
+
+
+# In[ ]:
+
+
+dev_dataset = torchvision.datasets.ImageFolder(root='/content/validation_classification', 
+                                               transform=torchvision.transforms.ToTensor())
+dev_dataloader = torch.utils.data.DataLoader(dev_dataset, batch_size=256, 
+                                             shuffle=True, num_workers=16)
+
+
+# In[19]:
+
+
+print(len(train_dataset.classes))
+# print(len(dev_dataset.classes))
+print(train_dataset.__len__())
+# print(dev_dataset.__len__())
+
+
+# In[ ]:
+
+
+#from torchsummaryX import summary
+class mobilenetV2(nn.Module):
+    #def __init__(self, num_feats, hidden_sizes, num_classes, feat_dim=10):
+    def __init__(self):
+        super(mobilenetV2, self).__init__()
+
+        self.layers = [
+        nn.Conv2d(in_channels=3,  out_channels=32, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(32),
+        #nn.ReLU6(inplace=True),
+        
+        InvertedResidualBlock(32,16,stride=1, expansion=1),
+
+        InvertedResidualBlock(16,24),
+        InvertedResidualBlock(24,24),
+        
+        InvertedResidualBlock(24,32),
+        InvertedResidualBlock(32,32),
+        InvertedResidualBlock(32,32),
+
+        InvertedResidualBlock(32,64),
+        InvertedResidualBlock(64,64),
+        InvertedResidualBlock(64,64), 
+        InvertedResidualBlock(64,64),
+
+        InvertedResidualBlock(in_channel=64,out_channel=96, stride=2, expansion=6),
+        InvertedResidualBlock(96,96),
+        InvertedResidualBlock(96,96),
+
+        InvertedResidualBlock(in_channel=96,out_channel=160,stride=2, expansion=6),
+        InvertedResidualBlock(160,160),
+        InvertedResidualBlock(160,160),
+
+        InvertedResidualBlock(160,320),
+
+        nn.Conv2d(320, 1280, 1, 1),
+        nn.BatchNorm2d(1280),
+        nn.ReLU6(inplace=True),
+
+        nn.AvgPool2d(8),
+
+        nn.Conv2d(1280, 2300, 1, 1),
+        nn.BatchNorm2d(2300),
+        nn.ReLU6(inplace=True)
+        ]
+
+        self.layers = nn.Sequential(*self.layers)
+        self.linear_label = nn.Linear(in_features=2300, out_features=2300, bias = False)
+        # self.conv_label = nn.Sequential(
+        #                       nn.Conv2d(in_channels=1280, out_channels=2300, kernel_size=1, stride=1,padding=0),
+        #                       nn.BatchNorm2d(2300))
+        #                       #nn.ReLU6(inplace=True))
+
+        # For creating the embedding to be passed into the Center Loss criterion
+        self.linear_closs = nn.Linear(2300, 2300, bias=False)
+        self.relu_closs = nn.ReLU()
+    
+    def forward(self, x, evalMode=False):
+        output = self.layers(x)
+        output = output.reshape(output.shape[0], output.shape[1])
+        # output = F.avg_pool2d(output, [output.size(2), output.size(3)], stride=1)
+        # output = output.reshape(output.shape[0], output.shape[1])
+        
+        label_output = self.linear_label(output)
+        label_output = label_output/torch.norm(self.linear_label.weight, dim=1)
+        # print(label_output.shape) #torch.Size([10, 2300])
+
+        # Create the feature embedding for the Center Loss
+        # closs_output = self.linear_closs(output)
+        closs_output = self.relu_closs(output)
+        # print(closs_output.shape) #torch.Size([10, 2300])
+        # del output
+        # torch.cuda.empty_cache()
+
+        return closs_output, label_output
+        # return np.zeros((666)), output
+
+def init_weights(m):
+    if type(m) == nn.Conv2d or type(m) == nn.Linear:
+        torch.nn.init.xavier_normal_(m.weight.data)
+
+
+# In[ ]:
+
+
+# #!pip install torchsummaryX
+# from torchsummaryX import summary
+# test_mobilenet = mobilenetV2()
+# summary(test_mobilenet, torch.zeros((10, 3, 32, 32)))
+
+
+# In[ ]:
+
+
+import time
+def train(model, data_loader, test_loader, task='Classification'):
+    
+    for epoch in range(numEpochs):
+        model.train()
+        avg_loss = 0.0
+        start_time  = time.time()
+        for batch_num, (feats, labels) in enumerate(data_loader):
+            
+            feats, labels = feats.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(feats)[1]
+
+#             print(outputs.shape)
+#             print(labels.long().shape)
+            loss = criterion(outputs, labels.long())
+            loss.backward()
+            optimizer.step()
+            
+            avg_loss += loss.item()
+            
+            
+            # if batch_num % 50 == 49:
+            #     print('Epoch: {}\tBatch: {}\tAvg-Loss: {:.4f} time elapsed:{:.2f}'.format(\
+            #           epoch+1, batch_num+1, avg_loss/50, end_time-start_time))
+                # avg_loss = 0.0    
+            
+            torch.cuda.empty_cache()
+            del feats
+            del labels
+            del loss
+            del outputs
+            gc.collect()
+        # print(batch_num)
+        end_time = time.time()
+        print('Epoch: {}\t Avg-Loss: {:.4f}\t time elapsed:{:.2f}\t learning rate:{:.4f}'.format(              epoch+1, avg_loss/(sample_size), end_time-start_time, optimizer.param_groups[0]['lr']))
+        torch.save(model.state_dict(), PATH)
+        # scheduler.step()
+         
+        if task == 'Classification':
+            val_loss, val_acc = test_classify(model, test_loader)
+            train_loss, train_acc = test_classify(model, data_loader)
+            print('Train Loss: {:.4f}\tTrain Accuracy: {:.4f}\tVal Loss: {:.4f}\tVal Accuracy: {:.4f}'.
+                  format(train_loss, train_acc, val_loss, val_acc))
+        else:
+            test_verify(model, test_loader)
+        scheduler.step(val_loss)
+
+
+def test_classify(model, test_loader):
+    with torch.no_grad():    
+        model.eval()
+        test_loss = []
+        accuracy = 0
+        total = 0
+
+        for batch_num, (feats, labels) in enumerate(test_loader):
+            feats, labels = feats.to(device), labels.to(device)
+            outputs = model(feats)[1]
+
+            _, pred_labels = torch.max(F.softmax(outputs, dim=1), 1)
+            pred_labels = pred_labels.view(-1)
+
+            loss = criterion(outputs, labels.long())
+
+            accuracy += torch.sum(torch.eq(pred_labels, labels)).item()
+            total += len(labels)
+            test_loss.extend([loss.item()]*feats.size()[0])
+
+            # torch.cuda.empty_cache()
+            del feats
+            del labels
+            del pred_labels
+            del loss
+            gc.collect()
+
+    model.train()# in order to start next epoch of training
+    return np.mean(test_loss), accuracy/total
+
+def test_verify(model, test_loader):
+    raise NotImplementedError
+
+
+# In[ ]:
+
+
+numEpochs = 50
+sample_size = len(train_dataset)
+PATH = "mobileNetwork.pt"
+
+# num_feats = 3
+# hidden_sizes = [32, 64]
+# num_classes = len(train_dataset.classes)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+network = mobilenetV2()
+network.apply(init_weights)
+
+# params from paper
+# learningRate = 0.01
+# weightDecay = 4e-5
+# criterion = nn.CrossEntropyLoss()
+# optimizer = torch.optim.RMSprop(params=network.parameters(), lr=learningRate, \
+#             alpha=0.9,weight_decay=weightDecay, momentum=0.9)
+# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.8, patience=3)
+
+#param from baseline
+learningRate = 0.01
+weightDecay = 5e-4
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.SGD(network.parameters(), lr=learningRate,             weight_decay=weightDecay, momentum=0.9, nesterov = True) #trial 1
+# optimizer = torch.optim.Adam(network.parameters(), lr=learningRate, betas=(0.9, 0.999), \
+#                              eps=1e-08, weight_decay=weightDecay, amsgrad=False)# bad result, no improvement
+# optimizer = torch.optim.RMSprop(params=network.parameters(), lr=learningRate, \
+#             alpha=0.99, weight_decay=weightDecay, momentum=0.9) # bad result, no improvement
+# scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.9)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.8, patience=3)
+
+
+# In[ ]:
+
+
+gc.collect()
+torch.cuda.empty_cache()
+
+
+# In[ ]:
+
+
+network.train()
+network.to(device)
+train(network, train_dataloader, dev_dataloader)
+
+
+# In[ ]:
+
+
+#train_dataset.classes
+idx_to_class = {}
+for a_class in train_dataset.classes:
+    idx_to_class[train_dataset.class_to_idx[a_class]] = a_class
+idx_to_class
+
+
+# In[ ]:
+
+
+text = open('/content/test_order_classification.txt',encoding='utf-8').read()
+file_list = []
+target_list = []
+for pic in text.split('\n'):
+    file_list.append(pic)
+    target_list.append(0)
+
+
+# In[ ]:
+
+
+class ImageDataset(Dataset):
+    def __init__(self, file_list, target_list, mode = 'classification'):
+        self.file_list = file_list
+        self.target_list = target_list
+        self.n_class = len(list(set(target_list)))
+        self.mode = mode
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, index):
+        #print('opening {}'.format(self.file_list[index]))
+        # for classification
+        if self.mode == 'classification':
+            img = Image.open('/content/test_classification/medium/'+self.file_list[index])
+            img = torchvision.transforms.ToTensor()(img)
+            label = self.target_list[index]
+            return img, label
+        # for verification
+        else:
+            img = Image.open('/content/test_verification/'+self.file_list[index])
+            img = torchvision.transforms.ToTensor()(img)
+            label = self.target_list[index]
+            return self.file_list[index], img, label
+
+
+# In[ ]:
+
+
+test_dataset = ImageDataset(file_list, target_list)
+test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=256, 
+                                             shuffle=False, num_workers=8)
+
+
+# In[ ]:
+
+
+# PATH = "mobileNetwork.pt"
+# network = mobilenetV2()
+# network.load_state_dict(torch.load(PATH))
+
+
+# In[ ]:
+
+
+def pred_classify(model, test_dataloader, idx_to_class):
+    with torch.no_grad():
+          model.eval()
+          test_loss = []
+          accuracy = 0
+          total = 0
+          class_labels = []
+
+          for batch_num, (feats, labels) in enumerate(test_dataloader):
+                feats, labels = feats.to(device), labels.to(device)
+                outputs = model(feats)[1]
+
+                _, pred_labels = torch.max(F.softmax(outputs, dim=1), 1)
+                pred_labels = pred_labels.view(-1)
+                for idx in pred_labels:
+                  # print("idx is {}, label is {}".format(idx.item(), idx_to_class[idx.item()]))
+                  class_labels.append(idx_to_class[idx.item()])        
+                # loss = criterion(outputs, labels.long())
+
+                # accuracy += torch.sum(torch.eq(pred_labels, labels)).item()
+                # total += len(labels)
+                # test_loss.extend([loss.item()]*feats.size()[0])
+                del feats
+                del labels
+                del pred_labels
+                del outputs
+                gc.collect()
+
+      #model.train()
+      return class_labels
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+network.eval()
+network.to(device)
+class_labels = pred_classify(network, test_dataloader, idx_to_class)
+
+
+# In[ ]:
+
+
+import pandas as pd
+prediction = pd.DataFrame(list(zip(file_list, class_labels)))
+prediction.columns = ['Id', 'Category']
+prediction.to_csv('/content/classification_prediction.csv',index = False)
+
+
+# In[ ]:
+
+
+text = open('/content/test_trials_verification_student.txt',encoding='utf-8').read()
+test_verification_file_pair = []
+test_verification_row = []
+test_verification_target = []
+for pic in text.split('\n'):
+    #print(pic)
+    test_verification_row.append(pic)
+    test_verification_file_pair.append((pic.split(" ")[0], pic.split(" ")[1]))
+    test_verification_target.append(0)
+
+
+# In[ ]:
+
+
+get_ipython().system('unzip test_verification.zip')
+
+
+# In[ ]:
+
+
+class verifyImageDataset(Dataset):
+    def __init__(self, test_verification_file_pair):
+        self.file_list = test_verification_file_pair
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, index):
+        #print('opening {}'.format(self.file_list[index]))
+        # for classification
+        img1 = Image.open('/content/test_verification/'+self.file_list[index][0])
+        img1 = torchvision.transforms.ToTensor()(img1)
+        img2 = Image.open('/content/test_verification/'+self.file_list[index][1])
+        img2 = torchvision.transforms.ToTensor()(img2)
+        return img1,img2
+
+
+# In[ ]:
+
+
+test_verification_dataset = verifyImageDataset(test_verification_file_pair)
+test_verify_dataloader = torch.utils.data.DataLoader(test_verification_dataset, batch_size=256, 
+                                             shuffle=False, num_workers=4)
+
+
+# In[ ]:
+
+
+torch.cuda.empty_cache()
+gc.collect() 
+
+
+# In[ ]:
+
+
+import time
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if not torch.cuda.is_available():
+    raise ValueError("GPU not available!")
+network = network.cuda() 
+def cos_similarity(model, test_verify_dataloader):
+    with torch.no_grad():
+        model.eval()
+        scores = []
+        cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+        # with torch.no_grad():
+        for batch_num, (feats1, feats2) in enumerate(test_verify_dataloader):
+            start_time = time.time()
+            feats1 = feats1.to(device)
+            feats2 = feats2.to(device)
+            embedding1 = model(feats1)[0]
+            embedding2 = model(feats2)[0]
+            #print(embedding1.shape)
+            s = cos(embedding1, embedding2).detach().cpu().numpy()
+            scores.append(s)
+            del feats1
+            del feats2
+            del embedding1
+            del embedding2
+            del s
+            torch.cuda.empty_cache()
+            gc.collect() 
+            end_time = time.time()
+            print("finish batch {}, time elapsed: {:.4f}".format(batch_num, end_time-start_time))
+    return scores
+
+scores = cos_similarity(network, test_verify_dataloader)
+
+
+# In[ ]:
+
+
+scores = np.array(scores)
+
+
+# In[ ]:
+
+
+scores2 = []
+for i in range(scores.shape[0]):
+    for j in range(scores[i].shape[0]):
+      scores2.append(scores[i][j])
+
+
+# In[49]:
+
+
+len(scores2)
+
+
+# In[ ]:
+
+
+import pandas as pd
+prediction = pd.DataFrame(list(zip(test_verification_row, scores2)))
+prediction.columns = ['trial', 'score']
+prediction.to_csv('/content/verification_prediction.csv', index = False)
+
